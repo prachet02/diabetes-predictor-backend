@@ -3,6 +3,7 @@ from flask_cors import CORS
 import pandas as pd
 import numpy as np
 import joblib
+import sys, traceback
 from sklearn.metrics import confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import IsolationForest
@@ -29,7 +30,7 @@ SECRET_KEY = os.environ.get('SECRET_KEY', 'change-me-in-render-env')
 serializer = URLSafeTimedSerializer(SECRET_KEY)
 DEMO_USER = os.environ.get('DEMO_USER', 'demo')
 DEMO_PASS = os.environ.get('DEMO_PASS', 'demo123')
-PUBLIC_PATHS = {'/api/login', '/api/health'}
+PUBLIC_PATHS = {'/api/login', '/api/health', '/api/debug'}
 
 @app.before_request
 def require_auth():
@@ -394,7 +395,19 @@ def _warm():
         _fit_anomaly('if', 0.05)                   # SVM is computed on first use instead
     except Exception as e:
         print('Anomaly warm-up failed:', e, flush=True)
-threading.Thread(target=_warm, daemon=True).start()
+_warm_thread = threading.Thread(target=_warm, daemon=True, name='warmup')
+_warm_thread.start()
+
+@app.route('/api/debug', methods=['GET'])
+def debug_state():
+    frames = sys._current_frames()
+    stacks = {}
+    for t in threading.enumerate():
+        f = frames.get(t.ident)
+        stacks[t.name] = traceback.format_stack(f)[-5:] if f else []
+    return jsonify({'cache_keys': [list(k) for k in _anomaly_cache.keys()],
+                    'warmup_alive': _warm_thread.is_alive(),
+                    'threads': stacks})
 
 
 @app.route('/api/health', methods=['GET'])
