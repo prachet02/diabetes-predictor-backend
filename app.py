@@ -3,7 +3,6 @@ from flask_cors import CORS
 import pandas as pd
 import numpy as np
 import joblib
-import sys, traceback
 from sklearn.metrics import confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import IsolationForest
@@ -30,7 +29,7 @@ SECRET_KEY = os.environ.get('SECRET_KEY', 'change-me-in-render-env')
 serializer = URLSafeTimedSerializer(SECRET_KEY)
 DEMO_USER = os.environ.get('DEMO_USER', 'demo')
 DEMO_PASS = os.environ.get('DEMO_PASS', 'demo123')
-PUBLIC_PATHS = {'/api/login', '/api/health', '/api/debug'}
+PUBLIC_PATHS = {'/api/login', '/api/health'}
 
 @app.before_request
 def require_auth():
@@ -362,11 +361,11 @@ def _score_user(mdl, model_type, user_input):
     return int(mdl.predict(row)[0])
 
 @app.route('/api/anomaly', methods=['POST'])
+@app.route('/api/anomaly', methods=['POST'])
 def detect_anomaly():
     try:
         t0 = time.perf_counter()
         data = request.get_json(silent=True) or {}
-        print(f"[anomaly] request received: {data.get('model_type')} {data.get('contamination')}", flush=True)
         model_type = 'svm' if data.get('model_type') in ('svm', 'ocsvm') else 'if'
         contamination = min(max(float(data.get('contamination', 0.05)), 0.005), 0.3)
         (mdl, payload), cached = _fit_anomaly(model_type, contamination)
@@ -376,7 +375,6 @@ def detect_anomaly():
                 user_pred = _score_user(mdl, model_type, data['input_data'])
             except Exception as e:
                 print('User scoring failed:', e, flush=True)
-        print('[anomaly] sending response', flush=True)
         return jsonify({'success': True, **payload, 'user_prediction': user_pred, 'cached': cached,
                         'elapsed_ms': int((time.perf_counter() - t0) * 1000)})
     except Exception as e:
@@ -387,14 +385,6 @@ try:
 except Exception as e:
     print('Anomaly warm-up failed:', e, flush=True)
 
-@app.route('/api/debug', methods=['GET'])
-def debug_state():
-    frames = sys._current_frames()
-    stacks = {}
-    for t in threading.enumerate():
-        f = frames.get(t.ident)
-        stacks[t.name] = traceback.format_stack(f)[-5:] if f else []
-    return jsonify({'cache_keys': [list(k) for k in _anomaly_cache.keys()], 'threads': stacks})
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
