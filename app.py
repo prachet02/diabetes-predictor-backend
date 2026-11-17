@@ -143,10 +143,11 @@ _eval_cache = {}
 def evaluate():
     try:
 
-        if model_type in _eval_cache:
-            return jsonify({'success': True, 'metrics': _eval_cache[model_type]})
         data = request.json
         model_type = data.get('model_type', 'lr')
+
+        if model_type in _eval_cache:
+            return jsonify({'success': True, 'metrics': _eval_cache[model_type]})
         
         cols = ['HighBP', 'HighChol', 'CholCheck', 'BMI', 'Smoker',
                 'Stroke', 'HeartDiseaseorAttack', 'PhysActivity', 'Fruits', 'Veggies',
@@ -362,7 +363,12 @@ def detect_anomaly():
         model_type = 'svm' if data.get('model_type') in ('svm', 'ocsvm') else 'if'
         contamination = min(max(float(data.get('contamination', 0.05)), 0.005), 0.3)
         (mdl, payload), cached = _fit_anomaly(model_type, contamination)
-        user_pred = _score_user(mdl, model_type, data['input_data']) if data.get('input_data') else None
+        user_pred = None
+        if data.get('input_data'):
+            try:
+                user_pred = _score_user(mdl, model_type, data['input_data'])
+            except Exception as e:
+                print('User scoring failed:', e)
         return jsonify({'success': True, **payload, 'user_prediction': user_pred, 'cached': cached,
                         'elapsed_ms': int((time.perf_counter() - t0) * 1000)})
     except Exception as e:
@@ -385,4 +391,4 @@ def health_check():
 
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5001)
+    app.run(host='0.0.0.0', port=5001)
