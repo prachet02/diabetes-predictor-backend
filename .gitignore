@@ -1,0 +1,4 @@
+__pycache__/
+.DS_Store
+fresh_start_env/
+app_backup.py
