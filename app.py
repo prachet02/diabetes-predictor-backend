@@ -312,11 +312,6 @@ VAR_EXPLAINED = [float(v) for v in pca.explained_variance_ratio_[:2]]
 X_SVM_FIT = X_SAMPLE_SCALED.sample(n=min(1000, len(X_SAMPLE_SCALED)), random_state=1)
 
 _anomaly_cache = {}
-_key_locks, _key_locks_guard = {}, threading.Lock()
-
-def _lock_for(key):
-    with _key_locks_guard:
-        return _key_locks.setdefault(key, threading.Lock())
 
 def _mean_diff(frame, mask):
     if not mask.any() or mask.all():
@@ -326,37 +321,34 @@ def _mean_diff(frame, mask):
 
 def _fit_anomaly(model_type, contamination):
     key = (model_type, round(contamination, 3))
-    if key in _anomaly_cache:                      # fast path, no lock
+    if key in _anomaly_cache:
         return _anomaly_cache[key], True
-    with _lock_for(key):
-        if key in _anomaly_cache:
-            return _anomaly_cache[key], True
-        t0 = time.perf_counter()
-        if model_type == 'if':
-            mdl = IsolationForest(contamination=contamination, random_state=1, n_estimators=60, n_jobs=1)
-            mdl.fit(X_SAMPLE)
-            preds = mdl.predict(X_SAMPLE)
-        else:
-            mdl = OneClassSVM(kernel='rbf', nu=contamination, gamma='scale', cache_size=500)
-            mdl.fit(X_SVM_FIT)                     # smaller training subset keeps the fit fast
-            preds = mdl.predict(X_SAMPLE_SCALED)
-        print(f'[anomaly] {key} took {time.perf_counter() - t0:.1f}s', flush=True)
-        anom = preds == -1
-        payload = {
-            'pca_data': {
-                'normal':  {'x': np.round(PCA_COORDS[~anom, 0], 3).tolist(), 'y': np.round(PCA_COORDS[~anom, 1], 3).tolist()},
-                'anomaly': {'x': np.round(PCA_COORDS[anom, 0], 3).tolist(),  'y': np.round(PCA_COORDS[anom, 1], 3).tolist()},
-            },
-            'variance_explained': VAR_EXPLAINED,
-            'anomaly_count': int(anom.sum()),
-            'total_count': int(len(preds)),
-            'feature_differences': _mean_diff(X_SAMPLE, anom),
-            'feature_differences_scaled': _mean_diff(X_SAMPLE_SCALED, anom),
-            'normal_sample': X_SAMPLE[~anom].head(10).round(3).to_dict('records'),
-            'anomaly_sample': X_SAMPLE[anom].head(10).round(3).to_dict('records'),
-        }
-        _anomaly_cache[key] = (mdl, payload)
-        return _anomaly_cache[key], False
+    t0 = time.perf_counter()
+    if model_type == 'if':
+        mdl = IsolationForest(contamination=contamination, random_state=1, n_estimators=60, n_jobs=1)
+        mdl.fit(X_SAMPLE)
+        preds = mdl.predict(X_SAMPLE)
+    else:
+        mdl = OneClassSVM(kernel='rbf', nu=contamination, gamma='scale', cache_size=500)
+        mdl.fit(X_SVM_FIT)
+        preds = mdl.predict(X_SAMPLE_SCALED)
+    print(f'[anomaly] {key} took {time.perf_counter() - t0:.1f}s', flush=True)
+    anom = preds == -1
+    payload = {
+        'pca_data': {
+            'normal':  {'x': np.round(PCA_COORDS[~anom, 0], 3).tolist(), 'y': np.round(PCA_COORDS[~anom, 1], 3).tolist()},
+            'anomaly': {'x': np.round(PCA_COORDS[anom, 0], 3).tolist(),  'y': np.round(PCA_COORDS[anom, 1], 3).tolist()},
+        },
+        'variance_explained': VAR_EXPLAINED,
+        'anomaly_count': int(anom.sum()),
+        'total_count': int(len(preds)),
+        'feature_differences': _mean_diff(X_SAMPLE, anom),
+        'feature_differences_scaled': _mean_diff(X_SAMPLE_SCALED, anom),
+        'normal_sample': X_SAMPLE[~anom].head(10).round(3).to_dict('records'),
+        'anomaly_sample': X_SAMPLE[anom].head(10).round(3).to_dict('records'),
+    }
+    _anomaly_cache[key] = (mdl, payload)
+    return _anomaly_cache[key], False
 
 def _score_user(mdl, model_type, user_input):
     row = pd.DataFrame([user_input])
@@ -390,13 +382,10 @@ def detect_anomaly():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
-def _warm():
-    try:
-        _fit_anomaly('if', 0.05)                   # SVM is computed on first use instead
-    except Exception as e:
-        print('Anomaly warm-up failed:', e, flush=True)
-_warm_thread = threading.Thread(target=_warm, daemon=True, name='warmup')
-_warm_thread.start()
+try:
+    _fit_anomaly('if', 0.05)        # warm up synchronously at import time, no background thread
+except Exception as e:
+    print('Anomaly warm-up failed:', e, flush=True)
 
 @app.route('/api/debug', methods=['GET'])
 def debug_state():
@@ -405,10 +394,7 @@ def debug_state():
     for t in threading.enumerate():
         f = frames.get(t.ident)
         stacks[t.name] = traceback.format_stack(f)[-5:] if f else []
-    return jsonify({'cache_keys': [list(k) for k in _anomaly_cache.keys()],
-                    'warmup_alive': _warm_thread.is_alive(),
-                    'threads': stacks})
-
+    return jsonify({'cache_keys': [list(k) for k in _anomaly_cache.keys()], 'threads': stacks})
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
