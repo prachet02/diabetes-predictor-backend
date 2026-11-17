@@ -373,6 +373,7 @@ def detect_anomaly():
     try:
         t0 = time.perf_counter()
         data = request.get_json(silent=True) or {}
+        print(f"[anomaly] request received: {data.get('model_type')} {data.get('contamination')}", flush=True)
         model_type = 'svm' if data.get('model_type') in ('svm', 'ocsvm') else 'if'
         contamination = min(max(float(data.get('contamination', 0.05)), 0.005), 0.3)
         (mdl, payload), cached = _fit_anomaly(model_type, contamination)
@@ -382,6 +383,7 @@ def detect_anomaly():
                 user_pred = _score_user(mdl, model_type, data['input_data'])
             except Exception as e:
                 print('User scoring failed:', e, flush=True)
+        print('[anomaly] sending response', flush=True)
         return jsonify({'success': True, **payload, 'user_prediction': user_pred, 'cached': cached,
                         'elapsed_ms': int((time.perf_counter() - t0) * 1000)})
     except Exception as e:
