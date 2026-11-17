@@ -7,7 +7,8 @@ from sklearn.metrics import confusion_matrix, accuracy_score, precision_score, r
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import IsolationForest
 from sklearn.svm import OneClassSVM
-import secrets
+import os, time, threading, hmac
+from itsdangerous import URLSafeTimedSerializer
 
 app = Flask(__name__)
 CORS(app)
@@ -24,12 +25,34 @@ pca = joblib.load('pca.pkl')
 # Load dataset
 df = pd.read_csv('processed_diabetes_data.csv')
 
-# Simple session storage
-active_sessions = {}
+SECRET_KEY = os.environ.get('SECRET_KEY', 'change-me-in-render-env')
+serializer = URLSafeTimedSerializer(SECRET_KEY)
+DEMO_USER = os.environ.get('DEMO_USER', 'demo')
+DEMO_PASS = os.environ.get('DEMO_PASS', 'demo123')
+PUBLIC_PATHS = {'/api/login', '/api/health'}
 
-DEMO_USER = 'demo'
-DEMO_PASS = 'demo123'
+@app.before_request
+def require_auth():
+    if request.method == 'OPTIONS' or request.path in PUBLIC_PATHS:
+        return None
+    token = request.headers.get('Authorization', '').replace('Bearer ', '').strip()
+    try:
+        serializer.loads(token, max_age=8 * 3600)
+    except Exception:
+        return jsonify({'success': False, 'error': 'Unauthorized'}), 401
 
+@app.route('/api/login', methods=['POST'])
+def login():
+    data = request.get_json(silent=True) or {}
+    ok = (hmac.compare_digest(str(data.get('username', '')).encode(), DEMO_USER.encode()) and
+          hmac.compare_digest(str(data.get('password', '')).encode(), DEMO_PASS.encode()))
+    if not ok:
+        return jsonify({'success': False, 'message': 'Invalid credentials'}), 401
+    return jsonify({'success': True, 'token': serializer.dumps({'u': DEMO_USER}), 'message': 'Login successful'})
+
+@app.route('/api/logout', methods=['POST'])
+def logout():
+    return jsonify({'success': True})
 
 def get_bmi_category(bmi):
     if bmi < 18.5:
@@ -40,36 +63,6 @@ def get_bmi_category(bmi):
         return "Overweight"
     else:
         return "Obese"
-
-
-@app.route('/api/login', methods=['POST'])
-def login():
-    data = request.json
-    username = data.get('username')
-    password = data.get('password')
-    
-    if username == DEMO_USER and password == DEMO_PASS:
-        session_token = secrets.token_hex(32)
-        active_sessions[session_token] = {'username': username}
-        
-        return jsonify({
-            'success': True,
-            'token': session_token,
-            'message': 'Login successful'
-        })
-    else:
-        return jsonify({
-            'success': False,
-            'message': 'Invalid credentials'
-        }), 401
-
-
-@app.route('/api/logout', methods=['POST'])
-def logout():
-    token = request.headers.get('Authorization')
-    if token and token in active_sessions:
-        del active_sessions[token]
-    return jsonify({'success': True, 'message': 'Logged out successfully'})
 
 
 @app.route('/api/predict', methods=['POST'])
@@ -144,9 +137,14 @@ def predict():
         }), 500
 
 
+_eval_cache = {}
+
 @app.route('/api/evaluate', methods=['POST'])
 def evaluate():
     try:
+
+        if model_type in _eval_cache:
+            return jsonify({'success': True, 'metrics': _eval_cache[model_type]})
         data = request.json
         model_type = data.get('model_type', 'lr')
         
@@ -190,6 +188,8 @@ def evaluate():
                 'tp': int(cm[1, 1])
             }
         }
+
+        _eval_cache[model_type] = metrics
         
         return jsonify({
             'success': True,
@@ -296,116 +296,84 @@ def explore():
             'error': str(e)
         }), 500
 
+SCALE_COLS = ['HighBP', 'HighChol', 'CholCheck', 'BMI', 'Smoker', 'Stroke', 'HeartDiseaseorAttack',
+              'PhysActivity', 'Fruits', 'Veggies', 'HvyAlcoholConsump', 'AnyHealthcare', 'NoDocbcCost',
+              'GenHlth', 'MentHlth', 'PhysHlth', 'DiffWalk', 'Sex', 'Age', 'Education', 'MidpointSalary']
+
+X_ALL = df.drop(columns='Diabetes_binary')
+X_SAMPLE = X_ALL.sample(n=min(3000, len(X_ALL)), random_state=42).reset_index(drop=True)
+X_SAMPLE_SCALED = X_SAMPLE.copy()
+X_SAMPLE_SCALED[SCALE_COLS] = scaler.transform(X_SAMPLE[SCALE_COLS])
+PCA_COORDS = pca.transform(X_SAMPLE_SCALED)[:, :2]          # computed once
+VAR_EXPLAINED = [float(v) for v in pca.explained_variance_ratio_[:2]]
+
+_anomaly_cache, _anomaly_lock = {}, threading.Lock()
+
+def _mean_diff(frame, mask):
+    if not mask.any() or mask.all():
+        return {c: 0.0 for c in SCALE_COLS}
+    d = frame.loc[mask, SCALE_COLS].mean() - frame.loc[~mask, SCALE_COLS].mean()
+    return {c: float(v) for c, v in d.items()}
+
+def _fit_anomaly(model_type, contamination):
+    key = (model_type, round(contamination, 3))
+    with _anomaly_lock:
+        if key in _anomaly_cache:
+            return _anomaly_cache[key], True
+        if model_type == 'if':
+            mdl = IsolationForest(contamination=contamination, random_state=1, n_estimators=100, n_jobs=1)
+            mdl.fit(X_SAMPLE); preds = mdl.predict(X_SAMPLE)
+        else:
+            mdl = OneClassSVM(kernel='rbf', nu=contamination, gamma='scale')
+            mdl.fit(X_SAMPLE_SCALED); preds = mdl.predict(X_SAMPLE_SCALED)
+        anom = preds == -1
+        payload = {
+            'pca_data': {
+                'normal':  {'x': np.round(PCA_COORDS[~anom, 0], 3).tolist(), 'y': np.round(PCA_COORDS[~anom, 1], 3).tolist()},
+                'anomaly': {'x': np.round(PCA_COORDS[anom, 0], 3).tolist(),  'y': np.round(PCA_COORDS[anom, 1], 3).tolist()},
+            },
+            'variance_explained': VAR_EXPLAINED,
+            'anomaly_count': int(anom.sum()),
+            'total_count': int(len(preds)),
+            'feature_differences': _mean_diff(X_SAMPLE, anom),
+            'feature_differences_scaled': _mean_diff(X_SAMPLE_SCALED, anom),
+            'normal_sample': X_SAMPLE[~anom].head(10).round(3).to_dict('records'),
+            'anomaly_sample': X_SAMPLE[anom].head(10).round(3).to_dict('records'),
+        }
+        _anomaly_cache[key] = (mdl, payload)
+        return _anomaly_cache[key], False
+
+def _score_user(mdl, model_type, user_input):
+    row = pd.DataFrame([user_input])
+    cat = get_bmi_category(float(user_input['BMI']))
+    for col, name in (('UnderWeight', 'Underweight'), ('NormalWeight', 'Normal weight'),
+                      ('OverWeight', 'Overweight'), ('Obese', 'Obese')):
+        row[col] = int(cat == name)
+    row = row.reindex(columns=X_ALL.columns, fill_value=0)     # same columns and order as training
+    if model_type == 'svm':
+        row[SCALE_COLS] = scaler.transform(row[SCALE_COLS])
+    return int(mdl.predict(row)[0])
 
 @app.route('/api/anomaly', methods=['POST'])
 def detect_anomaly():
     try:
-        data = request.json
-        model_type = data.get('model_type', 'if')
-        contamination = data.get('contamination', 0.05)
-        user_input = data.get('input_data')
-        
-        cols = ['HighBP', 'HighChol', 'CholCheck', 'BMI', 'Smoker',
-                'Stroke', 'HeartDiseaseorAttack', 'PhysActivity', 'Fruits', 'Veggies',
-                'HvyAlcoholConsump', 'AnyHealthcare', 'NoDocbcCost', 'GenHlth',
-                'MentHlth', 'PhysHlth', 'DiffWalk', 'Sex', 'Age', 'Education',
-                'MidpointSalary']
-        
-        # Sample data for faster processing (use 5000 samples instead of all)
-        X = df.drop('Diabetes_binary', axis=1).sample(n=min(5000, len(df)), random_state=42)
-        X_original = X.copy()
-        scaled_df = X.copy()
-        scaled_df[cols] = scaler.transform(scaled_df[cols])
-        
-        if model_type == 'if':
-            anomaly_model = IsolationForest(
-                contamination=contamination, 
-                random_state=1, 
-                n_estimators=100
-            )
-            anomaly_model.fit(X)
-            anomaly_scores = anomaly_model.decision_function(X)
-            anomaly_predictions = anomaly_model.predict(X)
-        else:
-            anomaly_model = OneClassSVM(
-                kernel='rbf', 
-                nu=contamination, 
-                gamma='scale'
-            )
-            anomaly_model.fit(scaled_df)
-            anomaly_scores = anomaly_model.decision_function(scaled_df)
-            anomaly_predictions = anomaly_model.predict(scaled_df)
-        
-        comps = pca.transform(scaled_df)
-        pca_data = pd.DataFrame(data=comps, columns=['PC1', 'PC2'])
-        pca_data['anomaly'] = anomaly_predictions
-        pca_data['anomaly_score'] = anomaly_scores
-        
-        normal_indices = pca_data[pca_data['anomaly'] == 1].index.tolist()
-        anomaly_indices = pca_data[pca_data['anomaly'] == -1].index.tolist()
-        
-        user_prediction = None
-        if user_input:
-            input_df = pd.DataFrame([user_input])
-            
-            if model_type == 'if':
-                user_prediction = int(anomaly_model.predict(input_df)[0])
-            else:
-                input_df[cols] = scaler.transform(input_df[cols])
-                user_prediction = int(anomaly_model.predict(input_df)[0])
-        
-        # Get unscaled data
-        normal_data_unscaled = X_original.iloc[normal_indices]
-        anomaly_data_unscaled = X_original.iloc[anomaly_indices]
-        
-        # Get scaled data
-        normal_data_scaled = scaled_df.iloc[normal_indices]
-        anomaly_data_scaled = scaled_df.iloc[anomaly_indices]
-        
-        # Calculate mean differences (unscaled)
-        mean_normal_unscaled = normal_data_unscaled[cols].mean().to_dict()
-        mean_anomaly_unscaled = anomaly_data_unscaled[cols].mean().to_dict()
-        
-        feature_differences_unscaled = {
-            feature: float(mean_anomaly_unscaled[feature] - mean_normal_unscaled[feature])
-            for feature in cols
-        }
-        
-        # Calculate mean differences (scaled)
-        mean_normal_scaled = normal_data_scaled[cols].mean().to_dict()
-        mean_anomaly_scaled = anomaly_data_scaled[cols].mean().to_dict()
-        
-        feature_differences_scaled = {
-            feature: float(mean_anomaly_scaled[feature] - mean_normal_scaled[feature])
-            for feature in cols
-        }
-        
-        # Sample datasets for display
-        normal_sample = normal_data_unscaled.head(10).to_dict('records')
-        anomaly_sample = anomaly_data_unscaled.head(10).to_dict('records')
-        
-        return jsonify({
-            'success': True,
-            'pca_data': {
-                'normal': pca_data[pca_data['anomaly'] == 1][['PC1', 'PC2']].to_dict('records'),
-                'anomaly': pca_data[pca_data['anomaly'] == -1][['PC1', 'PC2']].to_dict('records')
-            },
-            'variance_explained': [float(pca.explained_variance_ratio_[0]), 
-                                  float(pca.explained_variance_ratio_[1])],
-            'anomaly_count': len(anomaly_indices),
-            'total_count': len(pca_data),
-            'user_prediction': user_prediction,
-            'feature_differences': feature_differences_unscaled,
-            'feature_differences_scaled': feature_differences_scaled,
-            'normal_sample': normal_sample,
-            'anomaly_sample': anomaly_sample
-        })
-        
+        t0 = time.perf_counter()
+        data = request.get_json(silent=True) or {}
+        model_type = 'svm' if data.get('model_type') in ('svm', 'ocsvm') else 'if'
+        contamination = min(max(float(data.get('contamination', 0.05)), 0.005), 0.3)
+        (mdl, payload), cached = _fit_anomaly(model_type, contamination)
+        user_pred = _score_user(mdl, model_type, data['input_data']) if data.get('input_data') else None
+        return jsonify({'success': True, **payload, 'user_prediction': user_pred, 'cached': cached,
+                        'elapsed_ms': int((time.perf_counter() - t0) * 1000)})
     except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+def _warm():
+    try:
+        _fit_anomaly('if', 0.05); _fit_anomaly('svm', 0.05)
+    except Exception as e:
+        print('Anomaly warm-up failed:', e)
+threading.Thread(target=_warm, daemon=True).start()
 
 
 @app.route('/api/health', methods=['GET'])
