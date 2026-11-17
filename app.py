@@ -308,7 +308,14 @@ X_SAMPLE_SCALED[SCALE_COLS] = scaler.transform(X_SAMPLE[SCALE_COLS])
 PCA_COORDS = pca.transform(X_SAMPLE_SCALED)[:, :2]          # computed once
 VAR_EXPLAINED = [float(v) for v in pca.explained_variance_ratio_[:2]]
 
-_anomaly_cache, _anomaly_lock = {}, threading.Lock()
+X_SVM_FIT = X_SAMPLE_SCALED.sample(n=min(1000, len(X_SAMPLE_SCALED)), random_state=1)
+
+_anomaly_cache = {}
+_key_locks, _key_locks_guard = {}, threading.Lock()
+
+def _lock_for(key):
+    with _key_locks_guard:
+        return _key_locks.setdefault(key, threading.Lock())
 
 def _mean_diff(frame, mask):
     if not mask.any() or mask.all():
@@ -318,15 +325,21 @@ def _mean_diff(frame, mask):
 
 def _fit_anomaly(model_type, contamination):
     key = (model_type, round(contamination, 3))
-    with _anomaly_lock:
+    if key in _anomaly_cache:                      # fast path, no lock
+        return _anomaly_cache[key], True
+    with _lock_for(key):
         if key in _anomaly_cache:
             return _anomaly_cache[key], True
+        t0 = time.perf_counter()
         if model_type == 'if':
-            mdl = IsolationForest(contamination=contamination, random_state=1, n_estimators=100, n_jobs=1)
-            mdl.fit(X_SAMPLE); preds = mdl.predict(X_SAMPLE)
+            mdl = IsolationForest(contamination=contamination, random_state=1, n_estimators=60, n_jobs=1)
+            mdl.fit(X_SAMPLE)
+            preds = mdl.predict(X_SAMPLE)
         else:
-            mdl = OneClassSVM(kernel='rbf', nu=contamination, gamma='scale')
-            mdl.fit(X_SAMPLE_SCALED); preds = mdl.predict(X_SAMPLE_SCALED)
+            mdl = OneClassSVM(kernel='rbf', nu=contamination, gamma='scale', cache_size=500)
+            mdl.fit(X_SVM_FIT)                     # smaller training subset keeps the fit fast
+            preds = mdl.predict(X_SAMPLE_SCALED)
+        print(f'[anomaly] {key} took {time.perf_counter() - t0:.1f}s', flush=True)
         anom = preds == -1
         payload = {
             'pca_data': {
@@ -350,7 +363,7 @@ def _score_user(mdl, model_type, user_input):
     for col, name in (('UnderWeight', 'Underweight'), ('NormalWeight', 'Normal weight'),
                       ('OverWeight', 'Overweight'), ('Obese', 'Obese')):
         row[col] = int(cat == name)
-    row = row.reindex(columns=X_ALL.columns, fill_value=0)     # same columns and order as training
+    row = row.reindex(columns=X_ALL.columns, fill_value=0)
     if model_type == 'svm':
         row[SCALE_COLS] = scaler.transform(row[SCALE_COLS])
     return int(mdl.predict(row)[0])
@@ -368,7 +381,7 @@ def detect_anomaly():
             try:
                 user_pred = _score_user(mdl, model_type, data['input_data'])
             except Exception as e:
-                print('User scoring failed:', e)
+                print('User scoring failed:', e, flush=True)
         return jsonify({'success': True, **payload, 'user_prediction': user_pred, 'cached': cached,
                         'elapsed_ms': int((time.perf_counter() - t0) * 1000)})
     except Exception as e:
@@ -376,9 +389,9 @@ def detect_anomaly():
 
 def _warm():
     try:
-        _fit_anomaly('if', 0.05); _fit_anomaly('svm', 0.05)
+        _fit_anomaly('if', 0.05)                   # SVM is computed on first use instead
     except Exception as e:
-        print('Anomaly warm-up failed:', e)
+        print('Anomaly warm-up failed:', e, flush=True)
 threading.Thread(target=_warm, daemon=True).start()
 
 
